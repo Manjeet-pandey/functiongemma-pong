@@ -1,0 +1,14 @@
+# Build output
+/build/
+.cache/
+compile_commands.json
+
+# Model weights (downloaded, not committed)
+/models/*.gguf
+/models/*.bin
+
+# Generated fine-tune data
+/finetune/data/
+
+# OS / editor
+.DS_Store
