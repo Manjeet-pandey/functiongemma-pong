@@ -1,5 +1,6 @@
 #include "hud.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -87,7 +88,8 @@ void HUD::DrawLine(SDL_Renderer* renderer, int x, int y, const std::string& text
 }
 
 void HUD::Draw(SDL_Renderer* renderer, const AIDecision& ai, float fps,
-               int player_score, int ai_score) {
+               int player_score, int ai_score, float predicted_landing_y,
+               bool ball_incoming) {
   // Scoreboard (always, even without font — use big rects + optional text).
   char scorebuf[64];
   std::snprintf(scorebuf, sizeof(scorebuf), "%d  :  %d", player_score, ai_score);
@@ -144,10 +146,33 @@ void HUD::Draw(SDL_Renderer* renderer, const AIDecision& ai, float fps,
   DrawLine(renderer, x, y, line, gray);
   y += step;
 
-  std::snprintf(line, sizeof(line), "Inference: %s  |  target_y=%.0f  dir=%s",
+  std::snprintf(line, sizeof(line), "Inference: %s  |  paddle target_y=%.0f",
                 ai.inference_busy ? "BUSY" : "idle",
-                static_cast<double>(ai.target_y), ai.direction.c_str());
+                static_cast<double>(ai.target_y));
   DrawLine(renderer, x, y, line, ai.inference_busy ? yellow : green);
+  y += step;
+
+  // Offense: which strategy the model picked vs. the ideal, and where it aims.
+  if (ai.offense) {
+    const bool matched = (ai.chosen_tool == ai.ideal_tool);
+    std::snprintf(line, sizeof(line),
+                  "model picked: %s | ideal: %s | driving: %s",
+                  ai.chosen_tool.c_str(), ai.ideal_tool.c_str(),
+                  ai.model_driving ? "MODEL" : "IDEAL");
+    DrawLine(renderer, x, y, line, matched ? green : yellow);
+    y += step;
+    std::snprintf(line, sizeof(line),
+                  "AI hits ball at y=%.0f -> aims return to player-side y=%.0f  (player at y=%.0f)",
+                  static_cast<double>(predicted_landing_y),
+                  static_cast<double>(ai.desired_return_y),
+                  static_cast<double>(ai.player_center));
+    DrawLine(renderer, x, y, line, cyan);
+  } else {
+    std::snprintf(line, sizeof(line),
+                  "ball outgoing  |  %s -> recover to center y=%.0f",
+                  ai.chosen_tool.c_str(), static_cast<double>(ai.target_y));
+    DrawLine(renderer, x, y, line, gray);
+  }
   y += step;
 
   DrawLine(renderer, x, y,
@@ -166,6 +191,6 @@ void HUD::Draw(SDL_Renderer* renderer, const AIDecision& ai, float fps,
 
   // Footer controls
   DrawLine(renderer, x, kScreenH - 18,
-           "W/S or Up/Down: move  |  [ / ]: cadence  |  R: reset scores  |  Esc: quit",
+           "W/S: move | [ / ]: cadence | T: toggle model/ideal offense | R: reset | Esc: quit",
            gray);
 }

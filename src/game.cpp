@@ -5,6 +5,72 @@
 #include <cstdlib>
 #include <sstream>
 
+namespace {
+// Fold an unbounded y into the reflecting range [0, span] (triangle wave),
+// mirroring the ball's top/bottom wall bounces. Same math as the training oracle.
+float FoldReflect(float y, float span) {
+  if (span <= 0.f) return 0.f;
+  const float period = 2.f * span;
+  float m = std::fmod(y, period);
+  if (m < 0.f) m += period;
+  if (m > span) m = period - m;
+  return m;
+}
+}  // namespace
+
+float PredictBallLandingY(const GameState& g) {
+  const float paddle_face_x = static_cast<float>(kScreenW - kPaddleW);
+  const float span = static_cast<float>(kScreenH - kBallSize);
+
+  float predicted_ball_y;
+  if (g.ball_vx > 1.f && g.ball_x < paddle_face_x) {
+    const float t = (paddle_face_x - g.ball_x) / g.ball_vx;
+    const float y_unbounded = g.ball_y + g.ball_vy * t;
+    predicted_ball_y = FoldReflect(y_unbounded, span);
+  } else {
+    // Ball moving away (or already at the face): the good play is recover-to-center.
+    predicted_ball_y = (kScreenH - kBallSize) / 2.f;
+  }
+  return predicted_ball_y + kBallSize / 2.f;  // ball center
+}
+
+float PredictReturnY(const GameState& g, float ai_center_y) {
+  // Mirror BouncePaddle's reflection, then fly the ball back to the player face.
+  const float span = static_cast<float>(kScreenH - kBallSize);
+  const float impact_y = PredictBallLandingY(g) - kBallSize / 2.f;  // ball top at impact
+  const float offset = std::clamp((impact_y - ai_center_y) / (kPaddleH / 2.f), -1.f, 1.f);
+  const float max_angle = 55.f * static_cast<float>(M_PI) / 180.f;
+  const float angle = offset * max_angle;
+
+  // Post-bounce the ball starts at the AI face and flies left to the player face.
+  const float x0 = static_cast<float>(kScreenW - kPaddleW - kBallSize);
+  const float dx = x0 - static_cast<float>(kPaddleW);
+  const float y_unbounded = impact_y + std::tan(angle) * dx;
+  return FoldReflect(y_unbounded, span) + kBallSize / 2.f;  // ball center on player side
+}
+
+float AimPaddleForReturn(const GameState& g, float desired_return_y) {
+  // Search the reachable contact offsets for the paddle center that sends the
+  // rebound closest to desired_return_y (handles wall folding, which isn't
+  // analytically invertible). The paddle center must stay within +/- half a
+  // paddle of the impact point or it won't touch the ball.
+  const float impact_y = PredictBallLandingY(g) - kBallSize / 2.f;
+  float best_c = impact_y;
+  float best_err = 1e9f;
+  const int kSteps = 80;
+  for (int i = 0; i <= kSteps; ++i) {
+    const float offset = -1.f + 2.f * static_cast<float>(i) / kSteps;  // [-1, 1]
+    const float c = impact_y - offset * (kPaddleH / 2.f);
+    const float ry = PredictReturnY(g, c);
+    const float err = std::fabs(ry - desired_return_y);
+    if (err < best_err) {
+      best_err = err;
+      best_c = c;
+    }
+  }
+  return std::clamp(best_c, kPaddleH / 2.f, static_cast<float>(kScreenH) - kPaddleH / 2.f);
+}
+
 std::string SerializeStateForModel(const GameState& g) {
   // AI paddle is on the right; distance is ball → right paddle face.
   const float paddle_face_x = static_cast<float>(kScreenW - kPaddleW);

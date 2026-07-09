@@ -19,7 +19,9 @@ class HUD {
             const AIDecision& ai,
             float fps,
             int player_score,
-            int ai_score);
+            int ai_score,
+            float predicted_landing_y,
+            bool ball_incoming);
 
  private:
   void DrawLine(SDL_Renderer* renderer, int x, int y, const std::string& text,

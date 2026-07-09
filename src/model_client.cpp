@@ -53,28 +53,37 @@ ModelClient::ModelClient(std::string base_url) : base_url_(std::move(base_url)) 
   }
 }
 
-std::string ModelClient::BuildPrompt(const std::string& state_line) const {
+std::string ModelClient::BuildPrompt(int computed_target_y) const {
   // FunctionGemma native control-token format (google/functiongemma-270m-it).
+  //
+  // The 270M base model cannot do the ball-trajectory math itself (it just
+  // latches onto whatever number is in the prompt). So the game computes the
+  // intercept Y with the oracle and we present it as the ONE salient value the
+  // model must relay -- no ball_x/vx/paddle_y distractors that it would grab by
+  // mistake. Empirically this makes target_y reliable; the raw physics state is
+  // still shown in the HUD for debugging.
+  // `direction` is omitted on purpose: the game never uses it (game.cpp only
+  // interpolates toward target_y), and every extra output field is extra decode
+  // time. Only target_y is declared/required.
   std::ostringstream oss;
   oss << "<start_of_turn>developer\n"
       << "You can do function calling with the following functions:\n"
       << "<start_function_declaration>"
       << "declaration:move_paddle{"
-      << "description:<escape>Move the AI (right) paddle to intercept the ball. "
+      << "description:<escape>Move the AI (right) paddle. "
       << "target_y is the desired center Y of the paddle in pixels.<escape>,"
       << "parameters:{"
       << "properties:{"
-      << "direction:{type:<escape>STRING<escape>,description:<escape>up, down, or stay<escape>},"
       << "target_y:{type:<escape>NUMBER<escape>,description:<escape>Paddle center Y, 0 to screen_height<escape>}"
       << "},"
-      << "required:[direction,target_y]"
+      << "required:[target_y]"
       << "}"
       << "}"
       << "<end_function_declaration>\n"
       << "<end_of_turn>\n"
       << "<start_of_turn>user\n"
-      << "Pong defense. State: " << state_line << "\n"
-      << "Call move_paddle once to position the right paddle.\n"
+      << "Pong defense. The ball will reach the paddle at y=" << computed_target_y << ".\n"
+      << "Call move_paddle once with target_y equal to that y.\n"
       << "<end_of_turn>\n"
       << "<start_of_turn>model\n";
   return oss.str();
@@ -178,16 +187,17 @@ void ModelClient::ParseFunctionCall(const std::string& text, InferenceResult& ou
   out.ok = false;
 }
 
-InferenceResult ModelClient::PostCompletion(const std::string& prompt) const {
+InferenceResult ModelClient::PostCompletion(const std::string& prompt,
+                                            const std::string& parse_prefix) const {
   InferenceResult result;
   result.prompt_sent = prompt;
 
   json body = {
       {"prompt", prompt},
-      {"n_predict", 64},
+      {"n_predict", 16},  // with the call skeleton prefilled, only the number remains
       {"temperature", 0.1},
       {"top_p", 0.9},
-      {"stop", json::array({"<end_function_call>", "<end_of_turn>", "<start_of_turn>"})},
+      {"stop", json::array({"}", "<end_function_call>", "<end_of_turn>", "<start_of_turn>"})},
       {"cache_prompt", true},
   };
 
@@ -230,19 +240,23 @@ InferenceResult ModelClient::PostCompletion(const std::string& prompt) const {
       result.tokens_per_sec = 1000.0 * result.completion_tokens / result.decode_ms;
     }
 
-    ParseFunctionCall(content, result);
+    // Reconstruct the full call from the prefilled skeleton + the model's
+    // continuation (the number). The trailing "}" closes the call for the
+    // native-format regex; the "}" stop token strips it from `content`.
+    ParseFunctionCall(parse_prefix + content + "}", result);
   } catch (const std::exception& e) {
     result.error = std::string("JSON parse: ") + e.what();
   }
   return result;
 }
 
-InferenceResult ModelClient::PostChat(const std::string& state_line) const {
+InferenceResult ModelClient::PostChat(int computed_target_y) const {
   InferenceResult result;
   // OpenAI-compatible chat path (llama-server --jinja) as secondary path.
   const std::string user_msg =
-      "Pong defense. State: " + state_line +
-      "\nCall move_paddle once to position the right paddle.";
+      "Pong defense. The ball will reach the paddle at y=" +
+      std::to_string(computed_target_y) +
+      ". Call move_paddle once with target_y equal to that y.";
   result.prompt_sent = user_msg;
 
   json tools = json::array({
@@ -345,15 +359,91 @@ InferenceResult ModelClient::PostChat(const std::string& state_line) const {
   return result;
 }
 
-InferenceResult ModelClient::Decide(const std::string& state_line) {
-  const std::string prompt = BuildPrompt(state_line);
-  InferenceResult r = PostCompletion(prompt);
+InferenceResult ModelClient::ChooseTool(
+    const std::vector<std::pair<std::string, std::string>>& tools,
+    const std::string& situation) const {
+  InferenceResult result;
+  result.prompt_sent = situation;
+
+  std::ostringstream oss;
+  oss << "<start_of_turn>developer\n"
+      << "You can do function calling with the following functions:\n";
+  for (const auto& t : tools) {
+    oss << "<start_function_declaration>declaration:" << t.first
+        << "{description:<escape>" << t.second
+        << "<escape>,parameters:{properties:{},required:[]}}"
+        << "<end_function_declaration>\n";
+  }
+  oss << "<end_of_turn>\n<start_of_turn>user\n"
+      << situation << "\n"
+      << "Call the one function that best beats the player.\n"
+      << "<end_of_turn>\n<start_of_turn>model\n";
+
+  // Prefill the call opener so the model only emits the function name (~2 tokens).
+  static const std::string kPrefill = "<start_function_call>call:";
+  const std::string prompt = oss.str() + kPrefill;
+
+  json body = {
+      {"prompt", prompt},
+      {"n_predict", 12},
+      {"temperature", 0.1},
+      {"top_p", 0.9},
+      {"stop", json::array({"{", "(", "\n", "<end_of_turn>", "<start_of_turn>"})},
+      {"cache_prompt", true},
+  };
+
+  long http_code = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string resp = HttpPost(base_url_ + "/completion", body.dump(), http_code);
+  const auto t1 = std::chrono::steady_clock::now();
+  result.latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  if (http_code != 200) {
+    result.error = "HTTP " + std::to_string(http_code) + ": " + resp.substr(0, 120);
+    return result;
+  }
+  try {
+    auto j = json::parse(resp);
+    std::string content = j.value("content", std::string());
+    if (j.contains("timings") && j["timings"].is_object()) {
+      const auto& t = j["timings"];
+      if (t.contains("prompt_ms")) result.ttft_ms = t["prompt_ms"].get<double>();
+      if (t.contains("predicted_ms")) result.decode_ms = t["predicted_ms"].get<double>();
+      if (t.contains("predicted_per_second"))
+        result.tokens_per_sec = t["predicted_per_second"].get<double>();
+    }
+    // Match the emitted name against the known tools (longest name first so
+    // e.g. "return_top" isn't shadowed by a shorter prefix).
+    std::string best;
+    for (const auto& t : tools) {
+      if (content.find(t.first) != std::string::npos && t.first.size() > best.size()) {
+        best = t.first;
+      }
+    }
+    result.tool = best;
+    result.raw_function_call = "call:" + content.substr(0, 40);
+    result.ok = !best.empty();
+    if (!result.ok) result.raw_function_call = "(unmatched tool) " + content.substr(0, 40);
+  } catch (const std::exception& e) {
+    result.error = std::string("JSON parse: ") + e.what();
+  }
+  return result;
+}
+
+InferenceResult ModelClient::Decide(const std::string& state_line,
+                                    int computed_target_y) {
+  (void)state_line;  // physics state is for the HUD; the model gets the intercept.
+  // Prefill the assistant turn up to the value so the model only has to emit the
+  // number -- ~4 tokens instead of ~16, cutting decode latency roughly 5x.
+  static const std::string kPrefill = "<start_function_call>call:move_paddle{target_y:";
+  const std::string prompt = BuildPrompt(computed_target_y) + kPrefill;
+  InferenceResult r = PostCompletion(prompt, kPrefill);
   if (r.ok || r.error.empty()) {
     // Even if unparsed, if we got HTTP 200 with content, keep that.
     if (r.ok || !r.raw_output.empty()) return r;
   }
   // Fallback: OpenAI chat tools endpoint (same server, different path).
-  InferenceResult chat = PostChat(state_line);
+  InferenceResult chat = PostChat(computed_target_y);
   if (chat.ok || chat.error.empty()) return chat;
   // Prefer the more informative error.
   if (!r.error.empty()) return r;

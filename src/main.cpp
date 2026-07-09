@@ -137,6 +137,13 @@ int main(int argc, char** argv) {
           ai.SetCadenceMs(ai.CadenceMs() - 25);
           std::cout << "Cadence -> " << ai.CadenceMs() << " ms (harder)\n";
         }
+        if (e.key.keysym.scancode == SDL_SCANCODE_T) {
+          ai.SetUseModelPick(!ai.UseModelPick());
+          std::cout << "Offense driver -> "
+                    << (ai.UseModelPick() ? "MODEL pick (watch it reason)"
+                                          : "ideal (competitive)")
+                    << "\n";
+        }
       }
       if (e.type == SDL_KEYUP) {
         keys[e.key.keysym.scancode] = false;
@@ -200,13 +207,39 @@ int main(int argc, char** argv) {
     DrawRect(renderer, static_cast<int>(game.State().ball_x), static_cast<int>(game.State().ball_y),
              kBallSize, kBallSize, 255, 255, 255);
 
-    // Ghost marker for AI target (small tick on right margin).
+    // --- Debug overlay (both markers describe the AI/right side) ------------
+    // GREEN full-width line = where the ball will ACTUALLY cross the AI paddle
+    //   face, computed independently of the model (ground truth about the ball).
+    // ORANGE hollow paddle  = where the MODEL wants its paddle (target_y). The
+    //   solid AI paddle converges onto this outline. The model is correct only
+    //   when the orange outline sits on the green line; the gap is the model's
+    //   trajectory error (also shown as `err` in the HUD).
+    const bool ball_incoming =
+        game.State().ball_in_play && game.State().ball_vx > 0.f;
+    const float landing_y = PredictBallLandingY(game.State());
+
+    if (ball_incoming) {
+      const int ly = static_cast<int>(landing_y);
+      DrawRect(renderer, 0, ly, kScreenW, 2, 90, 255, 150);            // ground-truth landing
+      DrawRect(renderer, kScreenW - kPaddleW, ly - 1, kPaddleW, 4, 90, 255, 150);  // at paddle face
+    }
     if (decision.valid) {
       const int ty = static_cast<int>(decision.target_y);
-      DrawRect(renderer, kScreenW - 4, ty - 3, 4, 6, 255, 200, 80);
+      // Hollow paddle outline on the AI (right) side: where the paddle is headed.
+      SDL_SetRenderDrawColor(renderer, 255, 200, 80, 255);
+      SDL_Rect want{kScreenW - kPaddleW, ty - kPaddleH / 2, kPaddleW, kPaddleH};
+      SDL_RenderDrawRect(renderer, &want);
+    }
+    // Magenta marker on the PLAYER (left) side: where the AI is aiming its return
+    // (the tool's target). Watch it sit far from the blue player paddle.
+    if (decision.offense && decision.desired_return_y >= 0.f) {
+      const int ry = static_cast<int>(decision.desired_return_y);
+      DrawRect(renderer, 0, ry, kScreenW / 2, 1, 110, 40, 110);      // faint guide
+      DrawRect(renderer, 0, ry - 3, kPaddleW, 6, 235, 90, 235);      // aim marker at player face
     }
 
-    hud.Draw(renderer, decision, fps, game.State().player_score, game.State().ai_score);
+    hud.Draw(renderer, decision, fps, game.State().player_score,
+             game.State().ai_score, landing_y, ball_incoming);
 
     SDL_RenderPresent(renderer);
   }

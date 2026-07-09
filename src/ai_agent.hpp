@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 // Latest decision shared with the render/game thread.
 struct AIDecision {
@@ -30,6 +31,14 @@ struct AIDecision {
   int cadence_ms = 100;
   bool inference_busy = false;
   bool model_connected = false;
+
+  // Offense: the tool the model picked vs. the ideal, and where it's aiming.
+  bool offense = false;                    // ball incoming -> aiming is active
+  std::string chosen_tool = "(none)";      // function the model selected
+  std::string ideal_tool = "";             // deterministic best pick, for comparison
+  float desired_return_y = -1.f;           // where the driving shot aims (player side)
+  float player_center = kScreenH / 2.f;    // player paddle center (from the tool)
+  bool model_driving = false;              // true: model's pick steers; false: ideal steers
 };
 
 // Async FunctionGemma decision loop.
@@ -55,6 +64,12 @@ class AIAgent {
   void SetCadenceMs(int ms);
   int CadenceMs() const { return cadence_ms_.load(); }
 
+  // Offense driver: true = the model's tool pick steers the paddle (watch it
+  // reason, badly); false = the deterministic ideal steers (competitive AI).
+  // The model is still queried either way so the HUD can show its pick.
+  void SetUseModelPick(bool on) { use_model_pick_.store(on); }
+  bool UseModelPick() const { return use_model_pick_.load(); }
+
  private:
   void WorkerLoop();
   void RecordLatency(double ms);
@@ -62,11 +77,24 @@ class AIAgent {
   ModelClient client_;
   std::atomic<int> cadence_ms_{100};
   std::atomic<bool> stop_{false};
+  std::atomic<bool> use_model_pick_{false};  // default: competitive (ideal) offense
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
+  struct ToolShot {
+    std::string name;
+    float target_y;          // paddle center that executes this tool
+    float desired_return_y;  // where the ball would land on the player side
+  };
+
   bool work_pending_ = false;
   std::string pending_state_line_;
+  int pending_target_ = kScreenH / 2;  // oracle-computed intercept for this request
+  // Offense request inputs computed on the game thread in Tick().
+  std::string pending_situation_;
+  std::vector<ToolShot> pending_shots_;
+  std::string pending_ideal_;
+  float pending_player_center_ = kScreenH / 2.f;
   AIDecision latest_;
   double last_request_ms_ = -1e9;
   int decisions_rally_ = 0;
